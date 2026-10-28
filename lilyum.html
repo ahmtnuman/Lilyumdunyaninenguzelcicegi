@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#0c0a14" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Lilyum · Three.js</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0a0810; }
+  body {
+    position: fixed; inset: 0;
+    background: radial-gradient(130% 95% at 50% 28%, #33284a 0%, #1a1429 42%, #0a0810 100%);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none; user-select: none;
+    overscroll-behavior: none;
+  }
+  #scene {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    display: block; touch-action: none; outline: none;
+    opacity: 0; transition: opacity 1.8s ease;
+  }
+  #scene.ready { opacity: 1; }
+  .vignette {
+    position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at 50% 45%, transparent 50%, rgba(0,0,0,.55) 100%);
+  }
+  .title {
+    position: fixed; left: 0; right: 0;
+    top: max(18px, calc(env(safe-area-inset-top) + 10px));
+    text-align: center; pointer-events: none; padding: 0 20px;
+  }
+  .title .msg {
+    display: block;
+    font-family: Georgia, "Times New Roman", serif; font-style: italic; font-weight: 400;
+    font-size: clamp(17px, 4.6vw, 25px); line-height: 1.35; letter-spacing: .02em;
+    color: rgba(255,240,246,.94); text-shadow: 0 2px 14px rgba(0,0,0,.45);
+  }
+  .title .br { display: none; }
+  .title small {
+    display: block; margin-top: 8px;
+    font-size: 10px; font-weight: 300; letter-spacing: .42em; text-transform: uppercase;
+    color: rgba(255,232,242,.5);
+  }
+  @media (max-width: 640px) { .title .br { display: inline; } }
+  .hint {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: max(22px, calc(env(safe-area-inset-bottom) + 14px));
+    padding: 9px 16px; border-radius: 999px; white-space: nowrap; pointer-events: none;
+    background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.13);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    color: rgba(255,240,246,.88); font-size: 13px;
+    transition: opacity 1.2s ease;
+  }
+  .hint.hide { opacity: 0; }
+  #fallback {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    padding: 24px; text-align: center; color: #eee; font-size: 15px; line-height: 1.5;
+  }
+</style>
+
+<!-- Eski tarayıcılar için import map desteği -->
+<script async src="https://cdn.jsdelivr.net/npm/es-module-shims@1.8.2/dist/es-module-shims.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div class="vignette"></div>
+<div class="title"><span class="msg">Gözlerinin mavisi çok güzeldi,<br class="br"> aynı benim gözlerimin yeşili gibi</span></div>
+<div class="hint" id="hint">Sürükle: döndür · İki parmak: yakınlaştır</div>
+<div id="fallback">Bu cihaz veya tarayıcı WebGL desteklemiyor.<br>Lütfen güncel Chrome ya da Safari ile açın.</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+/* ───────────── Yardımcılar ───────────── */
+const V3 = THREE.Vector3;
+const clamp  = (x, a, b) => Math.min(b, Math.max(a, x));
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const mix    = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+function rng(seed) {             // tekrarlanabilir rastgele sayı (mulberry32)
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const canvas  = document.getElementById('scene');
+const hintEl  = document.getElementById('hint');
+const isTouch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+
+// Kalite ayarları (mobilde biraz daha hafif)
+const Q = {
+  dpr:     isTouch ? 1.75 : 2,
+  petalU:  isTouch ? 84 : 120,   // yaprak boyunca segment
+  petalV:  isTouch ? 30 : 40,    // yaprak enine segment
+  texW:    isTouch ? 640 : 1024,
+  shadow:  isTouch ? 1024 : 2048
+};
+
+/* ───────────── Renderer ───────────── */
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+} catch (e) {
+  document.getElementById('fallback').style.display = 'flex';
+  throw e;
+}
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, Q.dpr));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+
+// Mor-lacivert gece fonu. Işık geçiren yapraklar arkadaki rengi doğru alsın diye
+// CSS yerine sahnenin kendisine çiziliyor; ekran oranı değişince yeniden üretiliyor.
+let bgTex = null;
+function updateBackground(w, h) {
+  const W = 512, H = clamp(Math.round(512 * h / w), 256, 1400);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#0a0810'; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(W * 0.5, H * 0.28);
+  ctx.scale(1.3 * W, 0.95 * H);                      // CSS: radial-gradient(130% 95% at 50% 28%)
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+  g.addColorStop(0, '#33284a');
+  g.addColorStop(0.42, '#1a1429');
+  g.addColorStop(1, '#0a0810');
+  ctx.fillStyle = g; ctx.fillRect(-1, -1, 2, 2);
+  ctx.restore();
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  if (bgTex) bgTex.dispose();
+  bgTex = t;
+  scene.background = t;
+}
+
+// Yumuşak stüdyo yansımaları (softbox benzeri ortam)
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+/* ───────────── Kamera & kontroller ───────────── */
+const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 100);
+const target = new V3(0, -1.15, 0);
+const CAM_AZ = 0.6;
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(target);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.rotateSpeed = isTouch ? 0.75 : 0.9;
+controls.zoomSpeed = 0.9;
+controls.enablePan = false;
+controls.minDistance = 1.2;
+controls.maxDistance = 14;
+controls.minPolarAngle = 0.12;
+controls.maxPolarAngle = 1.75;
+controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_ROTATE };
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.8;
+
+let resumeTimer = null;
+controls.addEventListener('start', () => {
+  controls.autoRotate = false;
+  clearTimeout(resumeTimer);
+  hintEl.classList.add('hide');
+});
+controls.addEventListener('end', () => {
+  clearTimeout(resumeTimer);
+  resumeTimer = setTimeout(() => { controls.autoRotate = true; }, 3500);
+});
+setTimeout(() => hintEl.classList.add('hide'), 7000);
+
+/* ───────────── Stüdyo ışıkları ─────────────
+   Ana softbox (sıcak, gölgeli) + karşı dolgu (soğuk, zayıf) + arka/kontur ışığı
+   (yaprakların içinden geçen ışığı ortaya çıkarır) + düşük ortam ışığı.          */
+scene.add(new THREE.AmbientLight(0xffffff, 0.22));
+scene.add(new THREE.HemisphereLight(0xf2efec, 0x141414, 0.3));
+
+const key = new THREE.DirectionalLight(0xfff3e8, 2.3);
+key.position.set(3.5, 5.5, 4);
+key.target.position.set(0, -1.6, 0);
+key.castShadow = true;
+key.shadow.mapSize.set(Q.shadow, Q.shadow);
+Object.assign(key.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 1, far: 22 });
+key.shadow.bias = -0.0004;
+key.shadow.normalBias = 0.03;
+scene.add(key, key.target);
+
+const fill = new THREE.DirectionalLight(0xe6ecff, 0.65);
+fill.position.set(-4.5, 1.8, 3);
+scene.add(fill);
+
+const back = new THREE.DirectionalLight(0xffd8e8, 1.9);    // hafif pembe kontur, mor fona uyumlu
+back.position.set(-1.5, 4, -5);
+scene.add(back);
+
+const top = new THREE.DirectionalLight(0xffffff, 0.35);
+top.position.set(0.5, 8, 0.5);
+scene.add(top);
+
+/* ───────────── Prosedürel dokular ───────────── */
+// strength: pembe tonun yoğunluğu (1 = belirgin, <1 = daha açık)
+function petalTextures(seed, strength = 1) {
+  const R = rng(seed), W = Q.texW, H = Q.texW / 2, S = W / 512;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const b = document.createElement('canvas'); b.width = W; b.height = H;
+  const cx = c.getContext('2d'), bx = b.getContext('2d');
+  const ci = cx.createImageData(W, H), bi = bx.createImageData(W, H);
+
+  const WHITE = [255, 252, 249], BLUSH = [249, 218, 228], PINK = [236, 140, 178],
+        DEEP = [204, 72, 128], GREEN = [206, 226, 168], CREAM = [255, 247, 238];
+  const ph = R() * 6.28;
+
+  for (let y = 0; y < H; y++) {
+    const v = (y / (H - 1)) * 2 - 1, av = Math.abs(v);
+    for (let x = 0; x < W; x++) {
+      const u = x / (W - 1);                       // 0 = taban, 1 = uç
+
+      // Yumuşak pembe alan: tabanda geniş, uca doğru incelip kaybolan çan eğrisi
+      const sig = 0.24 + 0.36 * (1 - u);
+      const along = smooth(0.92, 0.1, u);
+      const flame = 1 + 0.06 * Math.sin(v * 9 + u * 4 + ph);           // çok hafif, düzensiz kenar
+      let p = along * Math.exp(-(v * v) / (2 * sig * sig * flame * flame));
+      p = clamp(p * 1.15 * strength, 0, 1);
+      p = p * p * (3 - 2 * p);                                          // geçişi daha da yumuşat
+
+      let col = mix(WHITE, BLUSH, smooth(0.0, 0.45, p));
+      col = mix(col, PINK, smooth(0.35, 0.9, p));
+      col = mix(col, DEEP, smooth(0.85, 1.0, p) * 0.35);
+
+      const rib = Math.exp(-v * v * 200);                               // orta damar
+      col = mix(col, PINK, rib * 0.18 * along * strength);
+
+      const throat = (1 - smooth(0.0, 0.16, u)) * Math.exp(-v * v * 4);  // yeşilimsi boğaz
+      col = mix(col, GREEN, throat * 0.85);
+
+      // İnce, düzensiz uzunlamasına damarlar (renkte çok hafif)
+      const vein = Math.pow(0.5 + 0.5 * Math.cos(v * Math.PI * 22 + Math.sin(u * 6 + v * 3 + ph) * 1.1), 6);
+      col = mix(col, PINK, vein * 0.08 * (0.3 + p));
+
+      col = mix(col, CREAM, smooth(0.8, 1.0, av) * 0.3);                // ince kenarlar
+      const n = (R() - 0.5) * 3;
+      const k = (y * W + x) * 4;
+      ci.data[k]     = clamp(col[0] + n, 0, 255);
+      ci.data[k + 1] = clamp(col[1] + n, 0, 255);
+      ci.data[k + 2] = clamp(col[2] + n, 0, 255);
+      ci.data[k + 3] = 255;
+
+      // Kabartma: orta damar oluğu + ince damarlar + uca doğru azalan doku
+      const fine = Math.pow(0.5 + 0.5 * Math.cos(v * Math.PI * 34 + Math.sin(u * 9 + ph) * 0.8), 4);
+      const h = 128 - rib * 60 + vein * 30 + fine * 16 * (1 - u * 0.6) + (R() - 0.5) * 4 - smooth(0.85, 1, av) * 14;
+      bi.data[k] = bi.data[k + 1] = bi.data[k + 2] = clamp(h, 0, 255);
+      bi.data[k + 3] = 255;
+    }
+  }
+  cx.putImageData(ci, 0, 0);
+  bx.putImageData(bi, 0, 0);
+
+  // Çiller: yumuşak kenarlı, yarı saydam, pembe bölgede kümelenen benekler
+  const dot = (ctx, x0, y0, rx, ry, rgb, a) => {
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+    g.addColorStop(0, `rgba(${rgb},${a})`);
+    g.addColorStop(0.55, `rgba(${rgb},${a * 0.75})`);
+    g.addColorStop(1, `rgba(${rgb},0)`);
+    ctx.save(); ctx.translate(x0, y0); ctx.scale(rx, ry);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 1, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  };
+  const spots = Math.round(140 * (0.45 + 0.55 * strength));
+  for (let i = 0; i < spots; i++) {
+    const u = 0.08 + Math.pow(R(), 1.6) * 0.5;
+    const spread = 0.62 - u * 0.6;
+    const v = (R() + R() + R() - 1.5) / 1.5 * spread;                   // merkezde yoğunlaşan dağılım
+    const px = u * W, py = (v * 0.5 + 0.5) * H;
+    const r = (0.9 + R() * 2.4) * (1.2 - u) * S;
+    const a = (0.22 + R() * 0.38) * (0.6 + 0.4 * strength) * (1 - u * 0.6);
+    dot(cx, px, py, r * 1.9, r, `${(140 + R() * 30) | 0},${(28 + R() * 20) | 0},${(82 + R() * 20) | 0}`, a);
+    dot(bx, px, py, r * 1.9, r, '255,255,255', 0.35);                  // çillerin hafif kabarıklığı
+  }
+
+  const map = new THREE.CanvasTexture(c);
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.anisotropy = maxAniso;
+  const bump = new THREE.CanvasTexture(b);
+  bump.anisotropy = maxAniso;
+  return { map, bump };
+}
+
+function leafTexture() {
+  const R = rng(91), W = 256, H = 64;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(W, H);
+  const BASE = [48, 96, 38], LIGHT = [118, 164, 80], DARK = [30, 64, 26], TIP = [140, 150, 68];
+  for (let y = 0; y < H; y++) {
+    const v = (y / (H - 1)) * 2 - 1, av = Math.abs(v);
+    for (let x = 0; x < W; x++) {
+      const u = x / (W - 1);
+      let col = mix(BASE, LIGHT, Math.exp(-v * v * 120) * 0.65);
+      col = mix(col, LIGHT, Math.pow(0.5 + 0.5 * Math.cos(v * Math.PI * 10), 12) * 0.15);
+      col = mix(col, DARK, smooth(0.6, 1.0, av) * 0.4);
+      col = mix(col, TIP, smooth(0.85, 1.0, u) * 0.3);
+      col = mix(col, LIGHT, (1 - smooth(0, 0.12, u)) * 0.25);
+      const n = (R() - 0.5) * 6, k = (y * W + x) * 4;
+      img.data[k] = clamp(col[0] + n, 0, 255);
+      img.data[k + 1] = clamp(col[1] + n, 0, 255);
+      img.data[k + 2] = clamp(col[2] + n, 0, 255);
+      img.data[k + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAniso;
+  return t;
+}
+
+function stemTexture() {
+  const R = rng(17), W = 256, H = 64;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    const a = y / H;
+    for (let x = 0; x < W; x++) {
+      const stripe = 0.5 + 0.5 * Math.sin(a * Math.PI * 2 * 7 + Math.sin(x * 0.05) * 0.3);
+      const col = mix([60, 110, 46], [104, 152, 74], stripe * 0.3);
+      const n = (R() - 0.5) * 6, k = (y * W + x) * 4;
+      img.data[k] = clamp(col[0] + n, 0, 255);
+      img.data[k + 1] = clamp(col[1] + n, 0, 255);
+      img.data[k + 2] = clamp(col[2] + n, 0, 255);
+      img.data[k + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(10, 1);
+  return t;
+}
+
+// Polen: koyu pas-turuncu zemin üzerinde parlak, düzensiz polen taneleri
+function pollenTextures() {
+  const R = rng(5), S = 128;
+  const c = document.createElement('canvas'); c.width = c.height = S;
+  const b = document.createElement('canvas'); b.width = b.height = S;
+  const ctx = c.getContext('2d'), bctx = b.getContext('2d');
+  ctx.fillStyle = '#7a2e10'; ctx.fillRect(0, 0, S, S);
+  bctx.fillStyle = '#404040'; bctx.fillRect(0, 0, S, S);
+  for (let i = 0; i < 900; i++) {
+    const x = R() * S, y = R() * S, r = 0.6 + R() * 1.8;
+    const t = R();
+    const col = mix([150, 58, 18], [226, 118, 38], t);
+    ctx.fillStyle = `rgba(${col[0] | 0},${col[1] | 0},${col[2] | 0},${0.5 + R() * 0.5})`;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    bctx.fillStyle = `rgba(255,255,255,${0.4 + R() * 0.5})`;
+    bctx.beginPath(); bctx.arc(x, y, r, 0, Math.PI * 2); bctx.fill();
+  }
+  const map = new THREE.CanvasTexture(c); map.colorSpace = THREE.SRGBColorSpace;
+  const bump = new THREE.CanvasTexture(b);
+  return { map, bump };
+}
+
+function radialSprite(inner, outer) {
+  const S = 128, c = document.createElement('canvas'); c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+  g.addColorStop(0, inner); g.addColorStop(1, outer);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, S, S);
+  return new THREE.CanvasTexture(c);
+}
+
+/* ───────────── Taç yaprağı geometrisi ─────────────
+   Orta damar, açısı yumuşakça artan bir eğri boyunca ilerler: önce dışa açılır,
+   uca doğru zarifçe geriye kıvrılır. Kesitte: tabanda çanak, orta damar oluğu,
+   uca doğru geriye rulo olan kenarlar, hafif dalga ve burulma.                    */
+function petalGeometry(o) {
+  const {
+    length: L, width: W, theta0, theta1, curl = 1.6, cup = 0.35,
+    ruffle = 0, ruffleFreq = 8, twist = 0, base = 0.05, groove = 0.07,
+    edgeRoll = 0, sway = 0, segU = Q.petalU, segV = Q.petalV, profilePow = 0.85
+  } = o;
+
+  // Orta damar eğrisi (ince adımlarla integrasyon)
+  const cl = [], ang = [];
+  let x = base, y = 0;
+  const ds = L / segU;
+  for (let i = 0; i <= segU; i++) {
+    const u = i / segU;
+    const e = Math.pow(u, curl);
+    const th = theta0 + (theta1 - theta0) * (e * e * (3 - 2 * e) * 0.35 + e * 0.65);
+    cl.push(x, y); ang.push(th);
+    x += Math.sin(th + 0.5 * (theta1 - theta0) / segU) * ds;
+    y += Math.cos(th + 0.5 * (theta1 - theta0) / segU) * ds;
+  }
+
+  const count = (segU + 1) * (segV + 1);
+  const pos = new Float32Array(count * 3), uv = new Float32Array(count * 2), idx = [];
+  let p = 0, q = 0;
+  for (let i = 0; i <= segU; i++) {
+    const u = i / segU, th = ang[i], cx = cl[2 * i], cy = cl[2 * i + 1];
+    const fx = -Math.cos(th), fy = Math.sin(th);                  // iç yüz yönü
+    const s = Math.sin(Math.PI * Math.pow(u, profilePow));
+    const w = W * (0.06 * (1 - u) + Math.pow(Math.max(s, 0), 0.85));
+    const zShift = sway * W * Math.sin(u * Math.PI) * Math.sin(u * Math.PI * 0.8);   // hafif S kıvrımı
+    for (let j = 0; j <= segV; j++) {
+      const v = (j / segV) * 2 - 1, av = Math.abs(v);
+      let off = cup * w * v * v * (1 - 1.5 * u);                  // tabanda çanak, uçta geriye
+      off -= groove * w * Math.exp(-v * v * 26) * (1 - 0.5 * u);  // orta damar oluğu
+      off += 0.012 * w * Math.cos(v * Math.PI * 4) * (1 - u) * (1 - av);  // yan damar sırtları
+      off -= edgeRoll * w * Math.pow(av, 3.5) * smooth(0.2, 0.95, u);     // kenarlar geriye rulo
+      off += ruffle * w * Math.sin(u * ruffleFreq * Math.PI + v * 1.5) * Math.pow(av, 2.5) * smooth(0.15, 0.75, u);
+      off += twist * u * u * v * w;
+      pos[p++] = cx + fx * off;
+      pos[p++] = cy + fy * off;
+      pos[p++] = v * w + zShift;
+      uv[q++] = u;
+      uv[q++] = (v + 1) / 2;
+    }
+  }
+  for (let i = 0; i < segU; i++) {
+    for (let j = 0; j < segV; j++) {
+      const a = i * (segV + 1) + j, b = a + segV + 1;
+      idx.push(a, b, a + 1, b, b + 1, a + 1);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+// Uca doğru incelen tüp (filament ve dişicik sapı için), tabandan uca renk geçişi
+function taperedTube(curve, segs, radial, r0, r1, c0, c1) {
+  const g = new THREE.TubeGeometry(curve, segs, 1, radial, false);
+  const pos = g.attributes.position;
+  const ctr = new V3(), pt = new V3(), col = new THREE.Color(), cols = [];
+  for (let i = 0; i <= segs; i++) {
+    const t = i / segs;
+    curve.getPointAt(t, ctr);
+    const r = r0 + (r1 - r0) * Math.pow(t, 0.8);
+    col.lerpColors(c0, c1, smooth(0, 0.7, t));
+    for (let j = 0; j <= radial; j++) {
+      const k = i * (radial + 1) + j;
+      pt.fromBufferAttribute(pos, k).sub(ctr).multiplyScalar(r).add(ctr);
+      pos.setXYZ(k, pt.x, pt.y, pt.z);
+      cols.push(col.r, col.g, col.b);
+    }
+  }
+  g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+  return g;
+}
+
+// Başçık (anter): iki loblu, hafif muz kavisli, yüzeyi tanecikli
+function antherGeometry() {
+  const g = new THREE.SphereGeometry(1, 32, 20);
+  const pos = g.attributes.position, p = new V3();
+  for (let i = 0; i < pos.count; i++) {
+    p.fromBufferAttribute(pos, i);
+    const a = Math.atan2(p.z, p.x);
+    const lobes = 0.8 + 0.2 * Math.pow(Math.abs(Math.cos(a)), 0.6);           // ortada oluk
+    const grain = 1 + 0.045 * Math.sin(p.x * 31 + p.y * 19) * Math.sin(p.z * 27 + p.y * 23);
+    const taper = 1 - 0.18 * p.y * p.y;
+    const yy = p.y * 0.064;
+    pos.setXYZ(i,
+      p.x * 0.023 * lobes * grain * taper + 0.009 * (1 - p.y * p.y),          // muz kavisi
+      yy,
+      p.z * 0.018 * lobes * grain * taper);
+  }
+  g.computeVertexNormals();
+  return g;
+}
+
+// Tepecik: üç loblu, ıslak görünümlü küçük topuz
+function stigmaGeometry() {
+  const g = new THREE.SphereGeometry(1, 28, 18);
+  const pos = g.attributes.position, p = new V3();
+  for (let i = 0; i < pos.count; i++) {
+    p.fromBufferAttribute(pos, i);
+    const a = Math.atan2(p.z, p.x);
+    const k = 1 + 0.22 * Math.cos(3 * a) * (1 - Math.abs(p.y));
+    pos.setXYZ(i, p.x * 0.03 * k, p.y * 0.021 + 0.004 * (1 - p.y * p.y), p.z * 0.03 * k);
+  }
+  g.computeVertexNormals();
+  return g;
+}
+
+function budGeometry() {
+  const pts = [], N = 48, Lb = 0.72;
+  for (let i = 0; i <= N; i++) {
+    const s = i / N;
+    const r = 0.095 * Math.pow(Math.max(Math.sin(Math.PI * Math.pow(s, 1.55)), 0), 0.75) + 0.012 * (1 - s);
+    pts.push(new THREE.Vector2(Math.max(r, 0.0005), s * Lb));
+  }
+  const g = new THREE.LatheGeometry(pts, 48);
+  const pos = g.attributes.position, cols = [];
+  const cA = new THREE.Color('#5c8f3e'), cB = new THREE.Color('#d2e0b0'), cC = new THREE.Color('#f0c8d8');
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const a = Math.atan2(z, x), s = y / Lb;
+    const k = 1 + 0.09 * Math.cos(3 * a) * smooth(0.1, 0.5, s);
+    pos.setX(i, x * k); pos.setZ(i, z * k);
+    c.lerpColors(cA, cB, smooth(0.1, 0.65, s));
+    c.lerp(cC, smooth(0.55, 1.0, s) * (0.3 + 0.2 * (1 - Math.cos(3 * a))));
+    cols.push(c.r, c.g, c.b);
+  }
+  g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+/* ───────────── Işık geçirgenliği (subsurface hissi) ─────────────
+   MeshPhysicalMaterial'ın ışık hesabına küçük bir ek: ışık yaprağın arkasından
+   geldiğinde, yüzeyin içinden geçmiş gibi renklendirilmiş yumuşak bir parlama
+   eklenir. İnce kenarlar ve uçlar daha çok ışık geçirir.                          */
+function addTranslucency(mat, color, strength) {
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.sssColor = { value: new THREE.Color(color) };
+    shader.uniforms.sssStrength = { value: strength };
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 sssColor;\nuniform float sssStrength;')
+      .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
+      #if NUM_DIR_LIGHTS > 0
+      {
+        float thin = 1.0;
+        #ifdef USE_MAP
+          float vv = abs(vMapUv.y * 2.0 - 1.0);
+          thin = 0.55 + 0.45 * smoothstep(0.3, 1.0, vv) + 0.3 * vMapUv.x;
+        #endif
+        vec3 sss = vec3(0.0);
+        for (int i = 0; i < NUM_DIR_LIGHTS; i++) {
+          vec3 Ld = directionalLights[i].direction;
+          float backL = saturate(dot(-geometryNormal, Ld));
+          float through = pow(saturate(dot(geometryViewDir, -Ld)), 3.0);
+          sss += directionalLights[i].color * backL * (0.35 + 1.4 * through);
+        }
+        reflectedLight.directDiffuse += sss * sssColor * diffuseColor.rgb * sssStrength * thin;
+      }
+      #endif`);
+  };
+  mat.customProgramCacheKey = () => 'sss-' + color + '-' + strength;
+  return mat;
+}
+
+/* ───────────── Malzemeler ───────────── */
+function petalMaterial(tex) {
+  const m = new THREE.MeshPhysicalMaterial({
+    map: tex.map, bumpMap: tex.bump, bumpScale: 1.7,
+    roughness: 0.62, metalness: 0,
+    specularIntensity: 0.45,                       // plastik parlaklığı yerine yumuşak yansıma
+    sheen: 0.45, sheenRoughness: 0.55, sheenColor: new THREE.Color('#fff0f4'),
+    transmission: 0.16, thickness: 0.06, ior: 1.36,
+    attenuationColor: new THREE.Color('#ffd3e2'), attenuationDistance: 0.4,
+    envMapIntensity: 0.35, side: THREE.DoubleSide
+  });
+  return addTranslucency(m, '#ffd0de', 0.75);
+}
+const palettes = [
+  { outer: petalMaterial(petalTextures(7, 1.0)),  inner: petalMaterial(petalTextures(19, 1.0)) },
+  { outer: petalMaterial(petalTextures(23, 0.7)), inner: petalMaterial(petalTextures(31, 0.7)) }
+];
+
+const stemMat = new THREE.MeshPhysicalMaterial({
+  map: stemTexture(), roughness: 0.55, specularIntensity: 0.5, sheen: 0.25, sheenColor: new THREE.Color('#d8f0c0'),
+  envMapIntensity: 0.4
+});
+const leafMat = addTranslucency(new THREE.MeshPhysicalMaterial({
+  map: leafTexture(), roughness: 0.5, specularIntensity: 0.55,
+  sheen: 0.25, sheenColor: new THREE.Color('#d8eec0'), envMapIntensity: 0.4, side: THREE.DoubleSide
+}), '#b8e070', 0.55);
+const filamentMat = new THREE.MeshPhysicalMaterial({
+  vertexColors: true, roughness: 0.45, specularIntensity: 0.5,
+  sheen: 0.4, sheenColor: new THREE.Color('#ffffff'), envMapIntensity: 0.4
+});
+const pollen = pollenTextures();
+const antherMat = new THREE.MeshPhysicalMaterial({
+  map: pollen.map, bumpMap: pollen.bump, bumpScale: 1.5,
+  roughness: 0.92, specularIntensity: 0.25,
+  sheen: 1.0, sheenRoughness: 0.75, sheenColor: new THREE.Color('#ffae6a'),    // tozlu polen kadifesi
+  envMapIntensity: 0.3
+});
+const stigmaMat = new THREE.MeshPhysicalMaterial({
+  color: '#8aa83e', roughness: 0.25, clearcoat: 1, clearcoatRoughness: 0.15, envMapIntensity: 0.6   // ıslak, yapışkan
+});
+const greenMat = new THREE.MeshPhysicalMaterial({
+  color: '#6a983e', roughness: 0.5, specularIntensity: 0.5, sheen: 0.3, sheenColor: new THREE.Color('#e0f2c8'), envMapIntensity: 0.4
+});
+const budMat = addTranslucency(new THREE.MeshPhysicalMaterial({
+  vertexColors: true, roughness: 0.5, specularIntensity: 0.5,
+  sheen: 0.4, sheenColor: new THREE.Color('#fff4f6'), envMapIntensity: 0.45
+}), '#e8f0c8', 0.4);
+
+// Ortak geometriler
+const receptacleGeo = new THREE.SphereGeometry(0.06, 28, 18);
+const ovaryGeo      = new THREE.CylinderGeometry(0.042, 0.032, 0.18, 24);
+const antherGeo     = antherGeometry();
+const stigmaGeo     = stigmaGeometry();
+const budGeo        = budGeometry();
+
+const FIL_BASE = new THREE.Color('#cfe0a0'), FIL_TIP = new THREE.Color('#f4f2e2');
+const STY_BASE = new THREE.Color('#bcd48a'), STY_TIP = new THREE.Color('#dfe8b8');
+
+function shadowy(m) { m.castShadow = true; m.receiveShadow = true; return m; }
+const up = new V3(0, 1, 0);
+
+/* ───────────── Tek bir çiçek başı ───────────── */
+function makeHead(R, pal) {
+  const head = new THREE.Group();
+  const petals = [];
+
+  // Taç yaprakları: 3 dış (daha dar, daha çok kıvrık) + 3 iç (daha geniş, dalgalı kenar)
+  for (let k = 0; k < 6; k++) {
+    const inner = k % 2 === 1;
+    const phi = (k / 6) * Math.PI * 2 + (R() - 0.5) * 0.1;
+    const geo = petalGeometry(inner
+      ? { length: 1.08 * (0.95 + R() * 0.1), width: 0.29 * (0.94 + R() * 0.1), theta0: 0.36, theta1: 2.7 + (R() - 0.5) * 0.25,
+          curl: 1.75, cup: 0.42, groove: 0.08, edgeRoll: 0.16, ruffle: 0.05 + R() * 0.03, ruffleFreq: 8 + R() * 2,
+          twist: (R() - 0.5) * 0.35, sway: (R() - 0.5) * 0.25, base: 0.045 }
+      : { length: 1.12 * (0.95 + R() * 0.1), width: 0.22 * (0.94 + R() * 0.1), theta0: 0.48, theta1: 2.85 + (R() - 0.5) * 0.25,
+          curl: 1.65, cup: 0.38, groove: 0.06, edgeRoll: 0.2, ruffle: 0.02, ruffleFreq: 7,
+          twist: (R() - 0.5) * 0.35, sway: (R() - 0.5) * 0.25, base: 0.058 });
+    const holder = new THREE.Group();
+    holder.rotation.y = phi;
+    const mesh = shadowy(new THREE.Mesh(geo, inner ? pal.inner : pal.outer));
+    holder.add(mesh);
+    head.add(holder);
+    petals.push({ mesh, ph: R() * 6.28 });
+  }
+
+  // Çanak tabanı ve yumurtalık
+  const receptacle = shadowy(new THREE.Mesh(receptacleGeo, greenMat));
+  receptacle.scale.y = 0.6; receptacle.position.y = -0.01;
+  const ovary = shadowy(new THREE.Mesh(ovaryGeo, greenMat));
+  ovary.position.y = -0.1;
+  head.add(receptacle, ovary);
+
+  // Ercikler: ince, uca doğru incelen, önce yükselip sonra dışa ve hafif aşağı kavis yapan sapçıklar
+  const stamenGroup = new THREE.Group();
+  head.add(stamenGroup);
+  for (let k = 0; k < 6; k++) {
+    const phi = (k / 6) * Math.PI * 2 + (R() - 0.5) * 0.3;
+    const dh = (R() - 0.5) * 0.08, dr = (R() - 0.5) * 0.05;
+    const side = (R() - 0.5) * 0.06;
+    const P = (r, y, s = 0) => new V3(r * Math.cos(phi) + s * Math.sin(phi), y, -r * Math.sin(phi) + s * Math.cos(phi));
+    const curve = new THREE.CatmullRomCurve3([
+      P(0.02, 0.0),
+      P(0.07, 0.2 + dh * 0.2),
+      P(0.15, 0.42 + dh * 0.5, side * 0.3),
+      P(0.25 + dr * 0.5, 0.58 + dh, side * 0.6),
+      P(0.35 + dr, 0.65 + dh, side),
+      P(0.43 + dr, 0.65 + dh, side),
+      P(0.48 + dr, 0.61 + dh, side)                 // uçta aşağı doğru zarif sarkma
+    ], false, 'centripetal');
+    stamenGroup.add(shadowy(new THREE.Mesh(taperedTube(curve, 56, 8, 0.0062, 0.0032, FIL_BASE, FIL_TIP), filamentMat)));
+
+    // Başçık sapın ucuna ortasından tutturulur ve sapa dik durur (lilyuma özgü "salınan" anter)
+    const end = curve.getPointAt(1), tan = curve.getTangentAt(1);
+    const axis = new V3().crossVectors(tan, up).normalize();
+    axis.y += (R() - 0.5) * 0.5; axis.normalize();
+    const anther = shadowy(new THREE.Mesh(antherGeo, antherMat));
+    anther.position.copy(end).addScaledVector(tan, 0.004).addScaledVector(up, -0.006);
+    anther.quaternion.setFromUnitVectors(up, axis);
+    anther.rotateY(R() * Math.PI);
+    anther.scale.setScalar(0.9 + R() * 0.2);
+    stamenGroup.add(anther);
+  }
+
+  // Dişicik: erciklerden uzun, ucu hafif yukarı kalkan ince sap + üç loblu tepecik
+  {
+    const phi = R() * Math.PI * 2;
+    const P = (r, y) => new V3(r * Math.cos(phi), y, -r * Math.sin(phi));
+    const curve = new THREE.CatmullRomCurve3(
+      [P(0, 0), P(0.02, 0.3), P(0.08, 0.58), P(0.17, 0.78), P(0.25, 0.87), P(0.3, 0.92)], false, 'centripetal');
+    stamenGroup.add(shadowy(new THREE.Mesh(taperedTube(curve, 64, 10, 0.012, 0.0085, STY_BASE, STY_TIP), filamentMat)));
+    const stig = new THREE.Mesh(stigmaGeo, stigmaMat);
+    stig.castShadow = true;
+    stig.position.copy(curve.getPointAt(1));
+    stig.quaternion.setFromUnitVectors(up, curve.getTangentAt(1));
+    stamenGroup.add(stig);
+  }
+
+  return { head, petals, stamenGroup };
+}
+
+/* ───────────── Cam vazo ölçüleri ───────────── */
+const FLOOR   = -3.7;              // vazonun durduğu zemin
+const VS      = 1.2;               // vazo ölçeği (profil 1.3 birim yüksekliğinde çiziliyor)
+const VASE_H  = 1.3 * VS;          // vazo yüksekliği
+const BASE_Y  = FLOOR + 0.07 * VS; // sapların kesik uçları vazonun iç tabanında
+const NECK_L  = 0.96 * VS;         // sap tabanından vazo boğazına
+const MOUTH_L = VASE_H - 0.07 * VS;// sap tabanından vazo ağzına
+const WATER_H = 0.72;              // su seviyesi (ölçeklenmemiş profil biriminde)
+
+/* ───────────── Tek bir kesme lilyum dalı ─────────────
+   Saplar vazonun dibinden çıkar, boğazda toplanır (çaprazlanır) ve ağızdan
+   sonra dışa doğru açılarak buket formunu oluşturur.                           */
+function makeStem(cfg) {
+  const { dir, lean, H, tilt, s, seed, pal, leafCount, bud, center } = cfg;
+  const R = rng(seed);
+
+  const root = new THREE.Group();                // vazonun dibinde, dalın yönüne döndürülmüş
+  root.position.set(0, BASE_Y, 0);
+  root.rotation.y = dir;
+  scene.add(root);
+  const sway = new THREE.Group();                // rüzgâr pivotu = vazo ağzı
+  sway.position.y = MOUTH_L;
+  root.add(sway);
+  const body = new THREE.Group();
+  body.position.y = -MOUTH_L;
+  sway.add(body);
+
+  const tiltQ = new THREE.Quaternion().setFromAxisAngle(new V3(0, 0, 1), tilt);
+  const headPos = new V3(lean, H, 0);
+  const headPivot = new THREE.Group();
+  headPivot.position.copy(headPos);
+  headPivot.quaternion.copy(tiltQ);
+  headPivot.scale.setScalar(s);
+  body.add(headPivot);
+  const { head, petals, stamenGroup } = makeHead(R, palettes[pal]);
+  headPivot.add(head);
+
+  // Sap: dipte karşı tarafta başlar, boğazdan geçer, ağızdan sonra dışa açılır
+  const E = new V3(0, -0.18 * s, 0).applyQuaternion(tiltQ).add(headPos);
+  const D = new V3(0, -1, 0).applyQuaternion(tiltQ);
+  const A = E.clone().addScaledVector(D, 0.6 * s);
+  const j = () => (R() - 0.5) * 0.04;
+  const B = center ? new V3(0, 0, 0) : new V3(-0.1, 0, j());
+  const N = center ? new V3(0, NECK_L, 0) : new V3(0.085, NECK_L, j());
+  const M = N.clone().lerp(A, 0.5); M.x += 0.03;
+  const stemCurve = new THREE.CatmullRomCurve3([
+    B, B.clone().lerp(N, 0.5), N, M, A,
+    E.clone().addScaledVector(D, 0.24 * s),
+    E.clone()
+  ], false, 'centripetal');
+  body.add(shadowy(new THREE.Mesh(new THREE.TubeGeometry(stemCurve, 128, 0.03 + 0.004 * s, 14, false), stemMat)));
+  // Kesik uç: açık renkli küçük kapak
+  const cut = new THREE.Mesh(new THREE.CircleGeometry(0.034, 16), new THREE.MeshStandardMaterial({ color: '#b9cf8e', roughness: 0.7 }));
+  cut.position.copy(B).add(new V3(0, 0.001, 0));
+  cut.rotation.x = -Math.PI / 2;
+  body.add(cut);
+
+  // Vazo ağzının üstünde kalan kısımda yapraklar (florist gibi alt yapraklar temizlenmiş)
+  let tStart = 0.35;
+  for (let t = 0; t <= 1; t += 0.01) {
+    if (stemCurve.getPointAt(t).y > MOUTH_L + 0.14) { tStart = t; break; }
+  }
+  const leaves = [];
+  const sizeK = 0.7 + 0.25 * (H / 3.9);
+  for (let i = 0; i < leafCount; i++) {
+    const t = tStart + (i / leafCount) * (0.78 - tStart) * 0.85;
+    const holder = new THREE.Group();
+    holder.position.copy(stemCurve.getPointAt(t));
+    holder.rotation.y = i * 2.4 + R() * 0.6 + (center ? 0 : Math.PI * 0.5);
+    const geo = petalGeometry({
+      length: (0.82 - i * 0.07) * sizeK, width: 0.07, theta0: 0.6, theta1: 2.0 + R() * 0.35,
+      curl: 1.3, cup: 0.3, groove: 0.1, base: 0, segU: 40, segV: 10, profilePow: 0.6, twist: (R() - 0.5) * 0.6
+    });
+    const mesh = shadowy(new THREE.Mesh(geo, leafMat));
+    mesh.position.x = 0.02;
+    holder.add(mesh);
+    body.add(holder);
+    leaves.push({ mesh, ph: R() * 6.28 });
+  }
+
+  // İsteğe bağlı kapalı tomurcuk
+  let budPivot = null;
+  if (bud) {
+    budPivot = new THREE.Group();
+    budPivot.position.copy(stemCurve.getPointAt(tStart + (1 - tStart) * 0.42));
+    body.add(budPivot);
+    const side = R() < 0.5 ? 1 : -1;
+    const ped = new THREE.CatmullRomCurve3([
+      new V3(0, 0, 0), new V3(0.03, 0.08, 0.12 * side), new V3(0.08, 0.26, 0.28 * side)
+    ]);
+    budPivot.add(shadowy(new THREE.Mesh(new THREE.TubeGeometry(ped, 24, 0.018, 10, false), stemMat)));
+    const b = shadowy(new THREE.Mesh(budGeo, budMat));
+    b.position.copy(ped.getPointAt(1));
+    b.quaternion.setFromUnitVectors(up, ped.getTangentAt(1));
+    b.scale.setScalar(0.85 + R() * 0.3);
+    budPivot.add(b);
+  }
+
+  return { root, sway, headPivot, tilt, petals, stamenGroup, leaves, budPivot,
+           ph: R() * 6.28, wphase: Math.cos(dir) * lean };
+}
+
+/* ───────────── Buket ───────────── */
+const DEG = Math.PI / 180;
+const centerDir = Math.atan2(-Math.cos(CAM_AZ), Math.sin(CAM_AZ));   // ortadaki çiçek kameraya baksın
+const layout = [
+  { a: null, lean: 0.12, H: 3.88, tilt: -0.42, s: 1.0,  seed: 42, pal: 0, leafCount: 4, bud: true, center: true },
+  { a: 20,   lean: 1.25, H: 3.08, tilt: -0.55, s: 0.93, seed: 11, pal: 1, leafCount: 3, bud: false },
+  { a: 112,  lean: 1.2,  H: 2.63, tilt: -0.6,  s: 0.88, seed: 73, pal: 0, leafCount: 3, bud: true  },
+  { a: 205,  lean: 1.3,  H: 3.28, tilt: -0.5,  s: 0.95, seed: 5,  pal: 1, leafCount: 3, bud: false },
+  { a: 290,  lean: 1.2,  H: 2.78, tilt: -0.58, s: 0.9,  seed: 58, pal: 0, leafCount: 3, bud: false }
+];
+const plants = layout.map(L => makeStem({ ...L, dir: L.a === null ? centerDir : L.a * DEG }));
+
+/* ───────────── Cam vazo ve su ─────────────
+   Kesit profili döndürülerek dış yüzey, kıvrık dudak ve iç yüzey tek parça
+   üretiliyor; kalın cam taban. Cam ve su gerçek ışık kırılmasıyla (transmission)
+   içindeki sapları gösteriyor.                                                     */
+{
+  const P = (r, y) => new THREE.Vector2(r, y);
+  const profile = [
+    P(0.0, 0.0), P(0.3, 0.0), P(0.33, 0.01), P(0.345, 0.04),                    // taban pahı
+    P(0.4, 0.2), P(0.43, 0.38), P(0.42, 0.55), P(0.37, 0.75), P(0.29, 0.92),    // şişkin gövde
+    P(0.235, 1.03), P(0.24, 1.12), P(0.27, 1.22), P(0.31, 1.285),               // boğaz ve açılan ağız
+    P(0.318, 1.298), P(0.31, 1.305), P(0.298, 1.295),                            // yuvarlatılmış dudak
+    P(0.258, 1.218), P(0.224, 1.12), P(0.216, 1.03),                             // iç yüzey
+    P(0.27, 0.92), P(0.35, 0.75), P(0.4, 0.55), P(0.41, 0.38), P(0.38, 0.2),
+    P(0.32, 0.085), P(0.0, 0.07)                                                  // kalın cam dip
+  ];
+  const glassMat = new THREE.MeshPhysicalMaterial({
+    color: '#fbfefd', metalness: 0, roughness: 0.0,
+    transmission: 1, thickness: 0.05, ior: 1.5,
+    attenuationColor: new THREE.Color('#e2f4ee'), attenuationDistance: 2.5,
+    specularIntensity: 0.85, envMapIntensity: 0.7, side: THREE.DoubleSide
+  });
+  const vase = new THREE.Mesh(new THREE.LatheGeometry(profile, 96), glassMat);
+  vase.position.y = FLOOR;
+  vase.scale.setScalar(VS);
+  scene.add(vase);
+
+  // Su: iç yüzeyi biraz içeriden takip eden, üstü düz kapalı hacim
+  const wp = [
+    P(0.0, 0.072), P(0.315, 0.087), P(0.375, 0.2), P(0.405, 0.38), P(0.395, 0.55),
+    P(0.35, WATER_H), P(0.0, WATER_H)
+  ];
+  const waterMat = new THREE.MeshPhysicalMaterial({
+    color: '#f2fbf8', metalness: 0, roughness: 0.0,
+    transmission: 1, thickness: 0.35, ior: 1.33,
+    attenuationColor: new THREE.Color('#cdebe1'), attenuationDistance: 1.6,
+    specularIntensity: 0.8, envMapIntensity: 0.6
+  });
+  const water = new THREE.Mesh(new THREE.LatheGeometry(wp, 96), waterMat);
+  water.position.y = FLOOR;
+  water.scale.setScalar(VS);
+  scene.add(water);
+}
+
+/* Zemin: yalnızca yumuşak gölge + vazo altında hafif temas gölgesi */
+const ground = new THREE.Mesh(new THREE.CircleGeometry(7, 64), new THREE.ShadowMaterial({ opacity: 0.45 }));
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = FLOOR;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const contact = new THREE.Mesh(
+  new THREE.PlaneGeometry(1.5, 1.5),
+  new THREE.MeshBasicMaterial({ map: radialSprite('rgba(0,0,0,0.5)', 'rgba(0,0,0,0)'), transparent: true, depthWrite: false })
+);
+contact.rotation.x = -Math.PI / 2;
+contact.position.y = FLOOR + 0.003;
+scene.add(contact);
+
+// Camın zemine düşürdüğü hafif, yeşilimsi ışık (kostik hissi)
+const caustic = new THREE.Mesh(
+  new THREE.PlaneGeometry(1.3, 0.9),
+  new THREE.MeshBasicMaterial({ map: radialSprite('rgba(200,255,235,0.22)', 'rgba(200,255,235,0)'),
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending })
+);
+caustic.rotation.x = -Math.PI / 2;
+caustic.position.set(-0.45, FLOOR + 0.005, -0.5);
+scene.add(caustic);
+
+/* ───────────── Boyutlandırma (responsive) ───────────── */
+function resize() {
+  const w = canvas.clientWidth || window.innerWidth;
+  const h = canvas.clientHeight || window.innerHeight;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, Q.dpr));
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  const hf = THREE.MathUtils.degToRad(40);
+  const vf = THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(hf / 2) / camera.aspect));
+  camera.fov = clamp(vf, 40, 64);
+  camera.updateProjectionMatrix();
+  updateBackground(w, h);
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+resize();
+
+// Başlangıçta kümenin tamamı ekrana sığacak mesafe
+{
+  const halfV = (camera.fov * DEG) / 2;
+  const halfH = Math.atan(Math.tan(halfV) * camera.aspect);
+  const dist = Math.max(2.05 / Math.tan(halfH), 3.15 / Math.tan(halfV));
+  camera.position.setFromSpherical(new THREE.Spherical(dist, 1.2, CAM_AZ)).add(target);
+  camera.lookAt(target);
+}
+
+document.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
+document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
+
+/* ───────────── Animasyon ───────────── */
+function wind(t) {
+  const gust = 0.55 + 0.45 * Math.sin(t * 0.23) * Math.sin(t * 0.11 + 1.3);
+  const wz = (Math.sin(t * 0.9) * 0.6 + Math.sin(t * 1.7 + 1.2) * 0.3 + Math.sin(t * 3.1 + 0.4) * 0.1) * gust;
+  const wx = (Math.sin(t * 0.73 + 2.0) * 0.6 + Math.sin(t * 1.4 + 0.5) * 0.3 + Math.sin(t * 2.7) * 0.1) * gust;
+  return { gust, wz, wx };
+}
+
+const clock = new THREE.Clock();
+let first = true;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  for (const p of plants) {
+    const tp = t - p.wphase * 0.45 + p.ph * 0.15;                // rüzgâr buketten dalga gibi geçer
+    const { gust, wz, wx } = wind(tp);
+
+    p.sway.rotation.set(wx * 0.018, 0, wz * 0.024);              // dal vazo ağzında hafifçe salınır
+    p.headPivot.rotation.set(wx * 0.05, Math.sin(tp * 0.5 + p.ph) * 0.03, p.tilt + wz * 0.06);
+
+    for (const pe of p.petals) {
+      pe.mesh.rotation.z = Math.sin(tp * 2.2 + pe.ph) * 0.012 + Math.sin(tp * 5.3 + pe.ph * 1.7) * 0.004 * gust + wz * 0.01;
+    }
+    for (const l of p.leaves) {
+      l.mesh.rotation.z = Math.sin(tp * 1.9 + l.ph) * 0.05 * gust;
+      l.mesh.rotation.x = Math.sin(tp * 1.3 + l.ph * 0.7) * 0.04 * gust;
+    }
+    p.stamenGroup.rotation.set(Math.sin(tp * 2.6 + p.ph) * 0.02 * gust, 0, Math.cos(tp * 2.1 + p.ph) * 0.02 * gust);
+    if (p.budPivot) p.budPivot.rotation.set(Math.sin(tp * 1.3 + 1) * 0.05 * gust, 0, Math.sin(tp * 1.1) * 0.06 * gust);
+  }
+
+  controls.update(dt);
+  renderer.render(scene, camera);
+
+  if (first) { first = false; canvas.classList.add('ready'); }
+});
+</script>
+</body>
+</html>
